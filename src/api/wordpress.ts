@@ -19,6 +19,10 @@ export class WordPressClient {
     });
   }
 
+  async testConnection(): Promise<void> {
+    await this.request<unknown>({ method: 'GET', url: '/wp/v2/users/me' });
+  }
+
   private async request<T>(config: AxiosRequestConfig): Promise<T> {
     await this.rateLimiter.wait();
     return withRetry(async () => {
@@ -56,7 +60,12 @@ export class WordPressClient {
 
   // ── Media Upload ─────────────────────────────────────────────
 
-  async uploadMedia(buffer: Buffer, filename: string, mimeType: string): Promise<WPMedia> {
+  async uploadMedia(
+    buffer: Buffer,
+    filename: string,
+    mimeType: string,
+    altText?: string,
+  ): Promise<WPMedia> {
     await this.rateLimiter.wait();
     return withRetry(async () => {
       const resp = await this.client.post<WPMedia>('/wp/v2/media', buffer, {
@@ -67,6 +76,10 @@ export class WordPressClient {
         timeout: 60000,
         maxContentLength: 20 * 1024 * 1024,
       });
+      // Set alt text if provided
+      if (altText && resp.data.id) {
+        await this.client.post(`/wp/v2/media/${resp.data.id}`, { alt_text: altText }).catch(() => {});
+      }
       return resp.data;
     }, `Upload media ${filename}`);
   }
@@ -75,19 +88,36 @@ export class WordPressClient {
 
   async createCourse(data: {
     title: string;
-    slug: string;
-    content: string;     // Full HTML course overview / syllabus
-    excerpt: string;     // Short description (SEO meta desc)
-    status: 'publish' | 'draft';
-    featured_media?: number;
-    course_cat?: number[];
-    meta: Record<string, unknown>;
-    tags?: string[];
+    content: string;
+    excerpt: string;
+    featuredImageId?: number;
+    categoryIds?: number[];
+    tagIds?: number[];
+    ageGroup: string;
+    ageLabel: string;
+    hasCertification: boolean;
   }): Promise<LPCourse> {
     return this.request<LPCourse>({
       method: 'POST',
       url: '/wp/v2/lp_course',
-      data,
+      data: {
+        title: data.title,
+        content: data.content,
+        excerpt: data.excerpt,
+        status: 'publish',
+        featured_media: data.featuredImageId,
+        course_cat: data.categoryIds ?? [],
+        tags: data.tagIds ?? [],
+        meta: {
+          _lp_course_price: '0',
+          _lp_selling_option: 'only_require_enroll',
+          _lp_passing_condition: 'evaluate_lesson',
+          _lp_passing_grade: 70,
+          _lp_duration: '0 weeks 0 days 0 hours 0 minutes',
+          _lp_featured: data.hasCertification ? 'yes' : 'no',
+          _lp_course_target_audience: data.ageLabel,
+        },
+      },
     });
   }
 
@@ -95,17 +125,34 @@ export class WordPressClient {
 
   async createLesson(data: {
     title: string;
-    slug: string;
-    content: string;     // Full HTML lesson content (rich, with images inline)
-    excerpt: string;     // Short SEO description
-    status: 'publish' | 'draft';
-    featured_media?: number;
-    meta: Record<string, unknown>;
+    content: string;
+    excerpt: string;
+    featuredImageId?: number;
+    courseId: number;
+    order: number;
   }): Promise<LPLesson> {
+    const slug = data.title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '');
+
     return this.request<LPLesson>({
       method: 'POST',
       url: '/wp/v2/lp_lesson',
-      data,
+      data: {
+        title: data.title,
+        slug,
+        content: data.content,
+        excerpt: data.excerpt,
+        status: 'publish',
+        featured_media: data.featuredImageId,
+        meta: {
+          _lp_course: data.courseId,
+          _lp_order: data.order,
+          _lp_preview: 'no',
+          _lp_duration: '0 hours 30 minutes',
+        },
+      },
     });
   }
 
@@ -113,15 +160,33 @@ export class WordPressClient {
 
   async createQuiz(data: {
     title: string;
-    slug: string;
     content: string;
-    status: 'publish' | 'draft';
-    meta: Record<string, unknown>;
+    courseId: number;
+    passingGrade?: number;
   }): Promise<LPQuiz> {
+    const slug = data.title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '');
+
     return this.request<LPQuiz>({
       method: 'POST',
       url: '/wp/v2/lp_quiz',
-      data,
+      data: {
+        title: data.title,
+        slug,
+        content: data.content,
+        status: 'publish',
+        meta: {
+          _lp_course: data.courseId,
+          _lp_passing_grade: data.passingGrade ?? 70,
+          _lp_attempts: -1,           // unlimited
+          _lp_show_result: 'yes',
+          _lp_review_questions: 'yes',
+          _lp_negative_marking: 'no',
+          _lp_duration: '0 hours 30 minutes',
+        },
+      },
     });
   }
 
@@ -129,59 +194,78 @@ export class WordPressClient {
 
   async createQuestion(data: {
     title: string;
-    slug: string;
-    content: string;
-    status: 'publish' | 'draft';
-    meta: Record<string, unknown>;
-    parent: number; // quiz ID
+    quizId: number;
+    type: 'multi_choice' | 'true_or_false' | 'fill_in_blanks';
+    answers: Array<{ text: string; isCorrect: boolean }>;
+    correctAnswer?: string;  // for fill_in_blanks
+    explanation?: string;
+    order: number;
   }): Promise<LPQuestion> {
+    // LearnPress stores answers as JSON in post content
+    const answerContent = JSON.stringify(
+      data.answers.map(a => ({
+        text: a.text,
+        is_true: a.isCorrect ? 'true' : 'false',
+      })),
+    );
+
+    const slug = `question-${data.quizId}-${data.order}`;
+
     return this.request<LPQuestion>({
       method: 'POST',
       url: '/wp/v2/lp_question',
-      data,
+      data: {
+        title: data.title,
+        slug,
+        content: answerContent,
+        status: 'publish',
+        parent: data.quizId,
+        meta: {
+          _lp_type: data.type,
+          _lp_question_explanation: data.explanation ?? '',
+          _lp_mark: 1,
+          _lp_order: data.order,
+        },
+      },
     });
   }
 
   // ── Curriculum Structure ─────────────────────────────────────
 
   /**
-   * Adds lessons and quizzes to a course curriculum via LearnPress REST API.
-   * Groups items into sections.
+   * Sets the full curriculum structure on a course via LearnPress REST API.
+   * Each section has an ordered list of lessons and quizzes.
    */
   async buildCurriculum(
     courseId: number,
     sections: Array<{
       title: string;
-      items: Array<{ id: number; type: 'lp_lesson' | 'lp_quiz' }>;
+      order: number;
+      items: Array<{ type: 'lesson' | 'quiz'; id: number; order: number }>;
     }>,
   ): Promise<void> {
+    // Map to LearnPress post type names
+    const lpSections = sections.map(section => ({
+      title: section.title,
+      order: section.order,
+      items: section.items.map(item => ({
+        id: item.id,
+        type: item.type === 'lesson' ? 'lp_lesson' : 'lp_quiz',
+        order: item.order,
+      })),
+    }));
+
     await this.request({
       method: 'POST',
       url: `/lp/v1/courses/${courseId}/curriculum`,
-      data: { sections },
-    });
-  }
-
-  /**
-   * Fallback: set lesson order via post meta if curriculum API not available.
-   */
-  async setLessonCourse(lessonId: number, courseId: number, order: number): Promise<void> {
-    await this.request({
-      method: 'POST',
-      url: `/wp/v2/lp_lesson/${lessonId}`,
-      data: {
-        meta: {
-          _lp_course: courseId,
-          _lp_order: order,
-        },
-      },
+      data: { sections: lpSections },
     });
   }
 
   // ── Tags ─────────────────────────────────────────────────────
 
   async getOrCreateTag(name: string): Promise<number> {
-    const slug = name.toLowerCase().replace(/\s+/g, '-');
+    const slug = name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
     try {
       const tags = await this.request<Array<{ id: number }>>({
         method: 'GET',
@@ -200,39 +284,30 @@ export class WordPressClient {
 
   // ── SEO Meta (Yoast / RankMath) ──────────────────────────────
 
-  /**
-   * Sets SEO metadata on any post via post meta.
-   * Supports both Yoast SEO and RankMath field names.
-   */
-  async setSeoMeta(postId: number, postType: 'lp_course' | 'lp_lesson', seoData: {
-    title: string;
-    description: string;
-    focusKeyword?: string;
-    ogTitle?: string;
-    ogDescription?: string;
-  }): Promise<void> {
+  async setSeoMeta(
+    postId: number,
+    data: {
+      title: string;
+      description: string;
+      keyword: string;
+      postType: 'lp_course' | 'lp_lesson';
+    },
+  ): Promise<void> {
     const meta: Record<string, string> = {
-      // Yoast SEO fields
-      _yoast_wpseo_title: seoData.title,
-      _yoast_wpseo_metadesc: seoData.description,
-      _yoast_wpseo_focuskw: seoData.focusKeyword ?? '',
-      // RankMath fields
-      rank_math_title: seoData.title,
-      rank_math_description: seoData.description,
-      rank_math_focus_keyword: seoData.focusKeyword ?? '',
-      // OpenGraph
-      _yoast_wpseo_opengraph_title: seoData.ogTitle ?? seoData.title,
-      _yoast_wpseo_opengraph_description: seoData.ogDescription ?? seoData.description,
+      // Yoast SEO
+      _yoast_wpseo_title: data.title,
+      _yoast_wpseo_metadesc: data.description,
+      _yoast_wpseo_focuskw: data.keyword,
+      // RankMath
+      rank_math_title: data.title,
+      rank_math_description: data.description,
+      rank_math_focus_keyword: data.keyword,
     };
 
-    const url = postType === 'lp_course'
+    const url = data.postType === 'lp_course'
       ? `/wp/v2/lp_course/${postId}`
       : `/wp/v2/lp_lesson/${postId}`;
 
-    await this.request({
-      method: 'POST',
-      url,
-      data: { meta },
-    });
+    await this.request({ method: 'POST', url, data: { meta } });
   }
 }
