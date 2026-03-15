@@ -23,8 +23,6 @@ export async function createQuiz(params: {
   }
 
   try {
-    const ageLabel = AGE_RANGES[course.ageGroup].label;
-
     // Generate quiz questions via Claude
     const generated = await contentGen.generateQuiz({
       courseTitle: course.title,
@@ -43,15 +41,27 @@ export async function createQuiz(params: {
       passingGrade: 70,
     });
 
-    // Create each question
+    // Create each question — convert GeneratedQuestion format to WP format
     for (let i = 0; i < generated.questions.length; i++) {
       const q = generated.questions[i];
+
+      // Map GeneratedQuestion.type → LearnPress question type
+      const lpType = q.type === 'true_false' ? 'true_or_false' : 'multi_choice';
+
+      // Convert options + correctAnswer index → { text, isCorrect }[] format
+      const correctIndices = Array.isArray(q.correctAnswer)
+        ? q.correctAnswer
+        : [q.correctAnswer];
+      const answers = q.options.map((text, idx) => ({
+        text,
+        isCorrect: correctIndices.includes(idx),
+      }));
+
       await wp.createQuestion({
         title: q.question,
         quizId: wpQuiz.id,
-        type: q.type || 'multi_choice',
-        answers: q.answers,
-        correctAnswer: q.correctAnswer,
+        type: lpType,
+        answers,
         explanation: q.explanation,
         order: i + 1,
       });
